@@ -1,0 +1,2 @@
+# Python dependencies for Letterboxd RSS feed generator
+letterboxdpy>=2.0.0

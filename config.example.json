@@ -1,0 +1,16 @@
+{
+  "plexToken": "YOUR_PLEX_TOKEN_HERE",
+  "plexUrl": "http://localhost:32400",
+  "rssUrls": [
+    "https://rss.plex.tv/YOUR_PLEX_RSS_ID",
+    "file:///C:/path/to/feeds/username.xml"
+  ],
+  "discordBotToken": "YOUR_DISCORD_BOT_TOKEN_HERE",
+  "discordChannelId": "YOUR_DISCORD_CHANNEL_ID_HERE",
+  "excludeLibraries": [
+    "Private Library 1",
+    "Private Library 2"
+  ],
+  "tautulliUrl": "http://localhost:8181",
+  "tautulliApiKey": "YOUR_TAUTULLI_API_KEY_HERE"
+}

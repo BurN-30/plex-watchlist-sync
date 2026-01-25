@@ -1,0 +1,36 @@
+﻿# Configuration files with sensitive data
+config.json
+letterboxd.config.json
+
+# Database files with personal watchlist data
+watchlist.json
+
+# Local RSS feeds with personal usernames
+feeds/*.xml
+
+# Node modules
+node_modules/
+node/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Windows shortcuts
+*.lnk
