@@ -1,476 +1,368 @@
-# 🎬 Plex Watchlist Sync
+# Plex Watchlist Sync
 
-> **A custom Discord bot that monitors RSS feeds (Plex, Letterboxd) and automatically notifies when content from your watchlist becomes available on your Plex server.**
+A Discord bot that monitors your Plex and Letterboxd watchlists and notifies you when content becomes available on your Plex server.
 
-[![Node.js](https://img.shields.io/badge/Node.js-22.x-green.svg)](https://nodejs.org/)
-[![Discord.js](https://img.shields.io/badge/Discord.js-14.x-blue.svg)](https://discord.js.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+## Features
 
----
+- **GUID Index System**: Loads entire Plex library once at startup for O(1) instant lookups
+- **3-Tier Detection**: T0 (GUID Index) → T1 (Tautulli) → T2 (Title Search)
+- **High Performance**: ~3 seconds to index 3700+ items, 99%+ matched instantly
+- **RSS Monitoring**: Tracks Plex and Letterboxd RSS feeds with IMDb/TMDb IDs
+- **Discord Notifications**: Instant alerts when movies/shows become available
+- **Auto-Cleanup**: Discord notifications auto-delete after 24 hours
+- **French Title Support**: Automatic localized title detection from Plex metadata
+- **Letterboxd Support**: Automatic watchlist synchronization with ID enrichment
+- **PM2 Watchdog**: Automatic restart on crash
 
-## ✨ Features
+## How It Works
 
-- 🔍 **Multi-source RSS parsing** (Plex Watchlist, Letterboxd)
-- 🎯 **Intelligent Plex detection** with 4-tier matching system
-- 🤖 **Discord notifications** with live-updating embeds
-- 📊 **Smart caching** for optimal performance
-- 🌍 **French title detection** (automatically uses localized Plex titles)
-- 🎭 **Auto type-correction** (movie ↔ show detection)
-- 📈 **Historical tracking** of watchlist evolution
+### GUID Index System
 
-## 🚀 Quick Start
+At each scan, the bot builds an index of your entire Plex library:
 
-```bash
-# Install dependencies
-npm install
-
-# Configure
-cp config.example.json config.json
-# Edit config.json with your credentials (see detailed guide below)
-
-# Run
-node index.js --test
+```
+[INDEX] Building GUID index from 10 sections...
+[INDEX] Indexed 3699 items (IMDb: 3079, TMDb: 3113, TVDB: 3054) in 2.7s
 ```
 
-## 📦 Prerequisites
+This creates Maps for instant O(1) lookups by IMDb, TMDb, and TVDB IDs.
+
+### 3-Tier Matching Strategy
+
+| Tier | Method | Speed | When Used |
+|------|--------|-------|-----------|
+| T0 | GUID Index Lookup | <1ms | Items with IMDb/TMDb/TVDB ID (99%+) |
+| T1 | Tautulli Search | ~100ms | Fallback for edge cases |
+| T2 | Plex Title Search | ~200ms | Items without any ID |
+
+### Example Output
+
+```
+[T0] "The Wild Robot" -> "Le Robot sauvage" (instant match)
+[T0] "Inception" -> "Inception" (instant match)
+[T1] "Close-Up" -> "Close-up" (Tautulli)
+[SCAN] Processed 502 items in 3.4s
+```
+
+## Prerequisites
 
 - **Node.js** 18.x or higher
-- **Plex Media Server** with a valid token
-- **Discord Webhook** or Bot with message permissions
-- **Tautulli** (optional, recommended for faster detection)
-- **Python 3.8+** (for Letterboxd sync)
+- **Python** 3.9+ (for Letterboxd)
+- **Plex Media Server** with access token
+- **Discord Bot** with token
+- **PM2** (optional, for production)
 
----
+## Installation
 
-## ⚙️ Configuration Guide
+### 1. Clone the repository
 
-### Step 1: Create Your Config File
-
-Copy the example configuration:
 ```bash
-cp config.example.json config.json
+git clone https://github.com/BurN-30/plex-watchlist-sync.git
+cd plex-watchlist-sync
 ```
 
-Your `config.json` should look like this:
+### 2. Configuration
+
+```bash
+# Copy configuration files
+copy config.example.json config.json
+copy letterboxd.config.example.json letterboxd.config.json
+```
+
+Edit `config.json` with your credentials:
+
 ```json
 {
   "plexToken": "YOUR_PLEX_TOKEN",
   "plexUrl": "http://localhost:32400",
   "rssUrls": [
     "https://rss.plex.tv/YOUR_RSS_ID",
-    "file:///C:/path/to/feeds/username.xml"
+    "file:///C:/path/to/plex-watchlist-sync/feeds/username.xml"
   ],
   "discordBotToken": "YOUR_DISCORD_BOT_TOKEN",
-  "discordChannelId": "YOUR_CHANNEL_ID",
+  "discordChannelId": "YOUR_DISCORD_CHANNEL_ID",
   "excludeLibraries": ["Private Library"],
   "tautulliUrl": "http://localhost:8181",
-  "tautulliApiKey": "YOUR_TAUTULLI_API_KEY"
+  "tautulliApiKey": "YOUR_TAUTULLI_API_KEY",
+  "scanInterval": 60
 }
 ```
 
----
-
-### 🔑 Step 2: Get Your Plex Token
-
-**Method 1: Via Plex Web App (Easiest)**
-
-1. Open **Plex Web App** in your browser (`http://localhost:32400/web` or `https://app.plex.tv`)
-2. Play **any media** (movie, show, music)
-3. Click the **three dots** (`...`) → Select **"Get Info"** or **"View XML"**
-4. Look at the browser URL bar, you'll see:
-   ```
-   https://app.plex.tv/desktop/#!/server/.../details?key=/library/metadata/12345&X-Plex-Token=AbCdEf123456789
-   ```
-5. Copy everything after `X-Plex-Token=` → That's your token!
-
-**Method 2: Via Plex Settings**
-
-1. Go to **Settings** → **Account**
-2. Scroll down to **"Authorized Devices"**
-3. Click on your server name
-4. Your token will be visible in the URL
-
-**Example:**
-```json
-"plexToken": "aBc123XyZ456-Pq7Rs8Tv"
-```
-
-⚠️ **Keep this token private!** It gives full access to your Plex server.
-
----
-
-### 📡 Step 3: Configure RSS URLs
-
-The bot supports **two types of RSS feeds**:
-
-#### A) Plex Watchlist RSS (Official)
-
-1. Go to [Plex Settings](https://app.plex.tv/desktop/#!/settings/watchlist)
-2. Click **"Get RSS Feed"** for each user
-3. Copy the URL (looks like `https://rss.plex.tv/a1f716af-6b6f-4541...`)
-4. Add to `rssUrls` array
-
-**Example:**
-```json
-"rssUrls": [
-  "https://rss.plex.tv/a1f716af-6b6f-4541-b18b-f2288e63cf89",
-  "https://rss.plex.tv/4493e83f-a5cb-41b9-a8e9-33e182ed25cc"
-]
-```
-
-#### B) Letterboxd Watchlists (via Python Scraper)
-
-Letterboxd doesn't provide official RSS feeds, so we use a Python scraper to generate compatible XML files.
-
-##### 🐍 Python Setup
-
-1. **Install Python dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. **Configure Letterboxd usernames:**
-   ```bash
-   cp letterboxd.config.example.json letterboxd.config.json
-   ```
-   
-   Edit `letterboxd.config.json` and add your friends' usernames:
-   ```json
-   {
-     "letterboxdUsernames": [
-       "friend1_username",
-       "friend2_username",
-       "friend3_username"
-     ]
-   }
-   ```
-
-3. **Generate XML feeds:**
-   ```bash
-   python scripts/letterboxd_watchlist_bot_updater.py
-   ```
-   
-   This creates RSS-compatible XML files in `feeds/`:
-   ```
-   feeds/
-     ├── friend1_username.xml
-     ├── friend2_username.xml
-     └── friend3_username.xml
-   ```
-
-4. **Add to config.json** using absolute paths with `file://` protocol:
-   ```json
-   "rssUrls": [
-     "https://rss.plex.tv/YOUR_PLEX_RSS",
-     "file:///C:/Plex%20Tools/plex-watchlist-sync/feeds/friend1_username.xml",
-     "file:///C:/Plex%20Tools/plex-watchlist-sync/feeds/friend2_username.xml"
-   ]
-   ```
-
-##### 📅 Auto-Update Letterboxd Feeds (Optional)
-
-**Windows Task Scheduler:**
-```powershell
-schtasks /create /tn "Letterboxd Feed Update" /tr "python C:\Plex Tools\plex-watchlist-sync\scripts\letterboxd_watchlist_bot_updater.py" /sc daily /st 04:00
-```
-
-**Linux Cron:**
-```bash
-0 4 * * * cd /path/to/plex-watchlist-sync && python3 scripts/letterboxd_watchlist_bot_updater.py
-```
-
-⚠️ **Rate Limiting:** The script includes 3-6 second delays between requests to respect Letterboxd's servers.
-
-⚠️ **Important:**
-- Use **forward slashes** `/` (not backslashes `\`)
-- Use `%20` for spaces in paths
-- Use **absolute paths** starting with your drive letter
-
----
-
-### 🤖 Step 4: Setup Discord Webhook/Bot
-
-You have **two options**:
-
-#### Option A: Discord Webhook (Simpler, Recommended)
-
-1. Open your Discord server
-2. Go to **Server Settings** → **Integrations** → **Webhooks**
-3. Click **"New Webhook"**
-4. Name it (e.g., "Plex Bot"), choose the target channel
-5. Copy the **Webhook URL** (looks like `https://discord.com/api/webhooks/123456.../AbCdEf...`)
-6. Use it as `discordBotToken`:
-
-```json
-"discordBotToken": "https://discord.com/api/webhooks/1362841415654051940/GTnXOE...",
-"discordChannelId": "1362835444219248660"
-```
-
-#### Option B: Discord Bot (More Features)
-
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Click **"New Application"** → Give it a name
-3. Go to **"Bot"** tab → Click **"Add Bot"**
-4. **Copy the Bot Token** (click "Reset Token" if needed)
-5. Enable **"MESSAGE CONTENT INTENT"** (under Privileged Gateway Intents)
-6. Go to **"OAuth2"** → **"URL Generator"**
-7. Select:
-   - Scopes: `bot`
-   - Permissions: `Send Messages`, `Embed Links`, `Read Message History`
-8. Copy the generated URL and open it to **invite the bot** to your server
-9. Get your **Channel ID**:
-   - Enable **Developer Mode** in Discord (User Settings → Advanced)
-   - Right-click on your channel → **"Copy Channel ID"**
-
-```json
-"discordBotToken": "MTM2Mjg0MTQxNTY1NDA1MTk0MA.GTnXOE.WNHRwH1_q63NFo...",
-"discordChannelId": "1362835444219248660"
-```
-
----
-
-### 🔥 Step 5: Configure Tautulli (Optional but Recommended)
-
-Tautulli dramatically speeds up detection (M0 tier).
-
-#### Installing Tautulli
-
-1. Download from [tautulli.com](https://tautulli.com/)
-2. Install and connect to your Plex server
-3. Access Tautulli web interface (usually `http://localhost:8181`)
-
-#### Getting API Key
-
-1. Open Tautulli → **Settings** (⚙️)
-2. Go to **"Web Interface"** tab
-3. Scroll down to **"API"**
-4. Click **"Show API Key"**
-5. Copy the key
-
-#### Add to Config
-
-```json
-"tautulliUrl": "http://localhost:8181",
-"tautulliApiKey": "5d4b8704a7d94e6290c78f84311871e6"
-```
-
-**If running on another machine:**
-```json
-"tautulliUrl": "http://192.168.1.100:8181",
-"tautulliApiKey": "YOUR_API_KEY"
-```
-
-⚠️ **If you don't have Tautulli**, the bot will still work but will be slower (uses M1-M3 tiers).
-
----
-
-### 🎯 Step 6: Plex URL Configuration
-
-#### Local Server (Same Machine)
-```json
-"plexUrl": "http://localhost:32400"
-```
-
-#### Remote Server (Different Machine on Network)
-```json
-"plexUrl": "http://192.168.1.50:32400"
-```
-
-#### Remote Server (Internet/Cloud)
-```json
-"plexUrl": "https://your-plex-server.com:32400"
-```
-
-To find your Plex Server URL:
-1. Open Plex Web App
-2. Settings → Network
-3. Look for **"Custom server access URLs"**
-
----
-
-### 📚 Step 7: Exclude Private Libraries (Optional)
-
-Hide specific libraries from scanning:
-
-```json
-"excludeLibraries": [
-  "Private Movies",
-  "Adult Content",
-  "Test Library"
-]
-```
-
-These libraries will be completely ignored by the bot.
-
----
-
-## ✅ Final Configuration Example
+Edit `letterboxd.config.json`:
 
 ```json
 {
-  "plexToken": "aBc123XyZ456-Pq7Rs8Tv",
-  "plexUrl": "http://localhost:32400",
-  "rssUrls": [
-    "https://rss.plex.tv/a1f716af-6b6f-4541-b18b-f2288e63cf89",
-    "file:///C:/Plex%20Tools/plex-watchlist-bot-FULL/feeds/friend1.xml",
-    "file:///C:/Plex%20Tools/plex-watchlist-bot-FULL/feeds/friend2.xml"
-  ],
-  "discordBotToken": "MTM2Mjg0MTQxNTY1NDA1MTk0MA.GTnXOE.WNHRwH1_q63...",
-  "discordChannelId": "1362835444219248660",
-  "excludeLibraries": ["Private Movies", "Test Content"],
-  "tautulliUrl": "http://localhost:8181",
-  "tautulliApiKey": "5d4b8704a7d94e6290c78f84311871e6"
+  "letterboxdUsernames": ["user1", "user2"]
 }
 ```
 
----
+### 3. Install Dependencies
 
-## 📖 Usage
+```bash
+# Node.js dependencies
+npm install
 
-### Manual Run
+# Python dependencies
+pip install -r requirements.txt
+```
+
+### 4. Run
+
+**Development/Test mode:**
 ```bash
 node index.js --test
 ```
 
-### Continuous Mode
+**Production with PM2:**
 ```bash
-node index.js
+npm install -g pm2
+pm2 start ecosystem.config.cjs
+pm2 save
 ```
 
-### Schedule Daily (Windows)
+**Or use the automated installer (Windows):**
 ```powershell
-.\SETUP_TASK.ps1
+.\INSTALL-PM2.ps1
 ```
-Creates a task that runs daily at **5:00 AM**.
 
-### View Scheduled Tasks
+## Configuration Guide
+
+### `plexToken` (Required)
+
+Your Plex authentication token.
+
+**How to get it:**
+1. Open: `https://plex.tv/devices.xml`
+2. Search for `token="` (Ctrl+F)
+3. Copy the alphanumeric string
+
+### `plexUrl` (Required)
+
+Your Plex Media Server URL.
+
+```json
+"plexUrl": "http://localhost:32400"
+```
+
+### `rssUrls` (Required)
+
+Array of RSS feed URLs to monitor.
+
+#### Plex Watchlist RSS
+
+1. Open Plex Web App
+2. Go to **Settings** → **Manage** → **Libraries** → **RSS Subscriptions**
+3. Copy your watchlist feed URL
+
+#### Letterboxd Feeds (Local Files)
+
+Use the `file://` protocol with absolute paths:
+
+```json
+"rssUrls": [
+  "https://rss.plex.tv/your-feed-id",
+  "file:///C:/Plex%20Tools/plex-watchlist-sync/feeds/username.xml"
+]
+```
+
+### `discordBotToken` (Required)
+
+Your Discord bot token (not a webhook URL).
+
+**How to create:**
+1. Go to https://discord.com/developers/applications
+2. Create **New Application** → Go to **Bot** tab → **Add Bot**
+3. **Reset Token** → Copy it
+4. Enable **Message Content Intent**
+5. Invite bot with: `Send Messages`, `Embed Links`, `Read Message History`, `Manage Messages`
+
+### `discordChannelId` (Required)
+
+1. Enable **Developer Mode** in Discord settings
+2. Right-click channel → **Copy Channel ID**
+
+### `excludeLibraries` (Optional)
+
+Libraries to exclude from scanning:
+
+```json
+"excludeLibraries": ["Private Movies", "Test Library"]
+```
+
+### `tautulliUrl` & `tautulliApiKey` (Optional, Recommended)
+
+Tautulli integration for T1 fallback searches.
+
+**Get API key:** Tautulli → Settings → Web Interface → API → Show API Key
+
+```json
+"tautulliUrl": "http://localhost:8181",
+"tautulliApiKey": "your-api-key"
+```
+
+### `scanInterval` (Optional)
+
+Scan interval in minutes. Omit for daily midnight scan.
+
+```json
+"scanInterval": 60
+```
+
+## Discord Notifications
+
+### Added Content (Auto-deletes after 24h)
+
+When content becomes available, an embed is sent:
+
+```
+🎬 New content available on Plex
+─────────────────────────────────
+🎥 Movies — 3 titles
+✓ The Wild Robot (2024)
+✓ Inception (2010)
+✓ Drive (2011)
+─────────────────────────────────
+Total: 3 new items
+```
+
+### Pending Watchlist (Persistent, auto-updated)
+
+A single embed tracks pending items and updates each scan:
+
+```
+📋 Watchlist — Pending content
+─────────────────────────────────
+🎥 Movies — 15 pending
+• Dune: Part Three (2026)
+• Avatar 3 (2025)
+...
+📊 15 items awaiting availability
+```
+
+## PM2 Commands
+
+```bash
+pm2 list                    # Process status
+pm2 logs                    # Real-time logs
+pm2 logs plex-watchlist-bot # Bot logs only
+pm2 restart all             # Restart all
+pm2 monit                   # CPU/RAM monitoring
+```
+
+Or use the PowerShell dashboard:
+
 ```powershell
-.\VIEW_TASKS.ps1
+.\MONITOR.ps1
+.\MONITOR.ps1 -Watch  # Continuous monitoring
 ```
 
-## 🔧 How It Works
+## Letterboxd Maintenance
 
-### Detection System (4 Tiers)
+### If scraper breaks
 
-1. **M0 - Tautulli** (Fastest): Direct API queries
-2. **M1 - Search API**: Title + ID matching
-3. **M2 - Year Scan**: Section-based year filtering
-4. **M3 - Nuclear**: Complete library scan (last resort)
+1. **Update selectors** in `letterboxd.selectors.json`:
+   ```json
+   {
+     "watchlist": {
+       "container": "ul.grid",
+       "item": "li.griditem",
+       "poster_div": "div.react-component[data-component-class='LazyPoster']",
+       "poster_attr_slug": "data-item-slug",
+       "poster_attr_id": "data-film-id",
+       "poster_attr_name": "data-item-name"
+     }
+   }
+   ```
 
+2. **Test the fix:**
+   ```bash
+   python scripts/letterboxd_scraper.py username
+   ```
+
+### Useful Commands
+
+```bash
+# Test scraper
+python scripts/letterboxd_scraper.py USERNAME
+
+# Force regenerate all feeds with IDs
+python scripts/letterboxd_watchlist_bot_updater.py --force-custom
+
+# Check selectors
+python scripts/letterboxd_watchlist_bot_updater.py --check-selectors
 ```
-RSS Feed → Parse Items → Check Plex (M0-M3) → Update Status → Notify Discord
-```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 plex-watchlist-sync/
-├── index.js                 # Main bot logic
-├── config.json              # Configuration (create from example)
-├── config.example.json      # Configuration template
-├── watchlist.json           # Database (auto-generated)
-├── feeds/                   # Local Letterboxd XML feeds (auto-generated)
+├── index.js                 # Main entry point
+├── package.json
+├── ecosystem.config.cjs     # PM2 configuration
+├── config.json              # Configuration (git ignored)
+├── letterboxd.config.json   # Letterboxd usernames (git ignored)
+├── letterboxd.selectors.json # Configurable CSS selectors
+├── requirements.txt         # Python dependencies
+│
+├── utils/
+│   ├── configLoader.js      # Config loading with validation
+│   ├── rssReader.js         # RSS feed reader (supports IMDb/TMDb IDs)
+│   ├── discordClient.js     # Discord client & embeds
+│   └── plexChecker.js       # GUID indexing & 3-tier matching
+│
 ├── scripts/
-│   └── letterboxd_watchlist_bot_updater.py  # Letterboxd feed generator
-└── utils/
-    ├── configLoader.js      # Configuration loader
-    ├── discordClient.js     # Discord embed builder
-    ├── plexChecker.js       # Plex detection engine (4-tier system)
-    └── rssReader.js         # RSS feed parser
+│   ├── letterboxd_scraper.py           # Scraping with ID enrichment
+│   └── letterboxd_watchlist_bot_updater.py
+│
+├── feeds/                   # Generated XML files (git ignored)
+├── logs/                    # PM2 logs (git ignored)
+│
+├── INSTALL-PM2.ps1          # Automated installation
+├── MONITOR.ps1              # Monitoring dashboard
+└── START.bat                # Development launcher
 ```
 
-## 🎨 Discord Notifications
+## Troubleshooting
 
-### New Additions Embed
-```
-🎉 New Additions to Plex
-✅ **Inception** (2010)
-✅ **Breaking Bad** (2008)
-```
+### Bot won't start
 
-### Pending Content Embed (Live-updating)
-```
-🕓 Pending Content
-🎬 Movies (12)
-🟡 Dune: Part Two (2024)
-🟡 The Batman (2022)
-
-📺 Shows (8)
-🟡 The Last of Us (2023)
+```bash
+node -e "console.log(require('./config.json'))"
+node index.js --test
 ```
 
-## 🛠️ Advanced Features
+### No matches found
 
-### Smart Caching
-- Section metadata cached per scan
-- Year-based results cached per session
-- Full library scans cached for M3 tier
+1. Check RSS feeds have IMDb/TMDb IDs:
+   ```bash
+   python scripts/letterboxd_watchlist_bot_updater.py --force-custom
+   ```
 
-### Duplicate Detection
-- Merges entries with matching provider IDs
-- Updates titles when better matches found
-- Auto-cleanup of duplicates
+2. Verify GUID index builds correctly:
+   ```
+   [INDEX] Indexed 3699 items (IMDb: 3079, TMDb: 3113, TVDB: 3054)
+   ```
 
-### Status Management
-- `pending`: In watchlist, not yet on Plex
-- `added`: Found on Plex server
-- Auto-transition when content appears/disappears
+### Letterboxd not working
 
-## 🐛 Troubleshooting
+```bash
+python scripts/letterboxd_watchlist_bot_updater.py --test USERNAME
+pm2 logs letterboxd-updater
+```
 
-### Bot doesn't find content
-1. Verify `plexToken` is valid
-2. Check libraries aren't in `excludeLibraries`
-3. Enable Tautulli for faster detection
-4. Ensure content has proper metadata (TMDB/IMDB/TVDB IDs)
+## Performance
 
-### RSS feeds not loading
-- Use proper `file://` encoding: `file:///C:/Path/To/file.xml`
-- Use `%20` for spaces in paths
-- Verify XML file validity
+| Metric | Value |
+|--------|-------|
+| Index build time | ~3s for 3700 items |
+| T0 lookup | <1ms per item |
+| Full scan (500 items) | ~4s total |
+| Memory usage | ~50MB |
 
-### Discord bot not posting
-1. Check `Send Messages` and `Embed Links` permissions
-2. Verify `discordChannelId` is correct
-3. Ensure bot token is valid
+## License
 
-### Tautulli not working
-1. Check `tautulliUrl` is accessible
-2. Verify API key is correct
-3. Check Tautulli logs for errors
-4. Bot will fallback to M1-M3 if Tautulli fails
+MIT License - see [LICENSE](LICENSE)
 
-## 🤝 Contributing
+## Contributing
 
-Feel free to:
-- 🐛 Report bugs via Issues
-- 💡 Suggest features
-- 🔧 Fork and adapt to your needs
-
-## ⚠️ Privacy Notice
-
-**This project is configured for personal use.**
-
-Before sharing:
-1. Remove sensitive data from `config.json`
-2. Clear personal entries from `watchlist.json`
-3. Don't commit tokens/API keys
-
-## 📄 License
-
-MIT License - Free to use and modify for personal use.
-
----
-
-## 🙏 Acknowledgments
-
-- [Plex Media Server](https://www.plex.tv/)
-- [Discord.js](https://discord.js.org/)
-- [Tautulli](https://tautulli.com/)
-- [Letterboxd](https://letterboxd.com/)
-
----
-
-**⚠️ Disclaimer:** This is a personal automation tool. Not affiliated with Plex Inc.
-
-**Made with ❤️ for efficient media management**
+Pull requests are welcome! For major changes, please open an issue first.
