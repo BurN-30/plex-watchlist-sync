@@ -1,179 +1,215 @@
-// index.js - Main bot logic
+// index.js - Plex Watchlist Sync Bot
+// Monitors RSS feeds and notifies when content becomes available on Plex
+
 import { loadConfig } from './utils/configLoader.js';
 import { fetchWatchlist } from './utils/rssReader.js';
-import { checkIfInPlex, clearScanCache, setPlexLogger } from './utils/plexChecker.js';
-import { getDiscordClient, buildAddedEmbed, buildPendingEmbed, sendOrUpdateEmbed } from './utils/discordClient.js';
+import { checkIfInPlex, clearScanCache, setPlexLogger, buildGuidIndex } from './utils/plexChecker.js';
+import { getDiscordClient, buildAddedEmbed, buildPendingEmbed, sendOrUpdateEmbed, sendAddedMessage, cleanupOldAddedMessages } from './utils/discordClient.js';
 import fs from 'fs';
 
-console.log('✅ Starting Plex Watchlist Bot...');
+console.log('Starting Plex Watchlist Sync Bot...');
 
 const config = loadConfig();
-const FILE   = './watchlist.json';
+const FILE = './watchlist.json';
 
-let data = { messages: { pending: null }, entries: [], history: [] };
-if (fs.existsSync(FILE)) { 
+// Initialize data structure
+let data = { messages: { pending: null, added: [] }, entries: [], history: [] };
+if (fs.existsSync(FILE)) {
   try {
-    data = JSON.parse(fs.readFileSync(FILE, 'utf-8')); 
-    // Migration / Safety checks
-    if (!data.messages) data.messages = { pending: null };
+    data = JSON.parse(fs.readFileSync(FILE, 'utf-8'));
+    if (!data.messages) data.messages = { pending: null, added: [] };
+    if (!data.messages.added) data.messages.added = [];
     if (!data.entries) data.entries = [];
     if (!data.history) data.history = [];
   } catch (e) {
-    console.error("❌ Error reading watchlist.json, resetting.", e);
-    data = { messages: { pending: null }, entries: [], history: [] };
+    console.error("Error reading watchlist.json, resetting.", e);
+    data = { messages: { pending: null, added: [] }, entries: [], history: [] };
   }
 }
 
-// Simple log handler
+// Logger
 function log(msg) {
   console.log(msg);
 }
 
-// Connect plexChecker logger to central logging system
 setPlexLogger(log);
 
 let isScanning = false;
 
+/**
+ * Main scan function
+ */
 async function run() {
   if (isScanning) {
-    log("⚠️ Scan already in progress, request ignored.");
+    log("[WARN] Scan already in progress, skipping.");
     return { addedFilms: 0, addedShows: 0 };
   }
   isScanning = true;
 
   try {
-    // Clear scan cache at the beginning of each cycle for fresh data
     clearScanCache();
-    
-    const now    = Date.now();
-    const client = await getDiscordClient(config.discordBotToken);
-    log(`\n=== 🔁 Scan started at ${new Date().toLocaleTimeString()} ===`);
 
+    const now = Date.now();
+    const client = await getDiscordClient(config.discordBotToken);
+    log(`\n=== Scan started at ${new Date().toLocaleTimeString()} ===`);
+
+    // Build GUID index first (one-time cost, enables O(1) lookups)
+    await buildGuidIndex(config);
+
+    // Fetch all RSS items
     const sources = Array.isArray(config.rssUrls) ? config.rssUrls : [config.rssUrl];
-    // Fetch RSS items
     const allItems = (await Promise.all(sources.map(fetchWatchlist))).flat();
-    log(`📰 ${allItems.length} items in RSS feeds.`);
+    log(`[RSS] ${allItems.length} items from ${sources.length} feeds`);
 
     const addedThisScan = [];
+    const startTime = Date.now();
 
     for (const it of allItems) {
       const { title, year, provider, id, type } = it;
 
-      // Smart retrieval from local file (ID > Title)
+      // Find existing entry by ID (preferred) or title
       let existing = data.entries.find(e => {
         if (e.provider && e.id && provider && id) return e.provider === provider && e.id === id;
         return e.title === title && e.type === type;
       });
 
-      // 🔍 PLEX SCAN: Systematic verification (Reliability > Speed)
-      // Query Plex every time to ensure content is still available
+      // Check Plex availability
       const plexResult = await checkIfInPlex(title, year, type, config, provider, id);
       const isInLib = plexResult.found;
       const plexTitle = plexResult.plexTitle;
-      const detectedType = plexResult.detectedType; // Actual type found in Plex (e.g., 'show' when we searched for 'movie')
+      const detectedType = plexResult.detectedType;
 
       if (!existing) {
+        // New item
         existing = {
-          title:   isInLib && plexTitle ? plexTitle : title,
-          year, 
-          type:    (isInLib && detectedType) ? detectedType : type, // Prioritize type detected by Plex
-          provider, id,
-          status:  isInLib ? 'added' : 'pending',
+          title: isInLib && plexTitle ? plexTitle : title,
+          year,
+          type: (isInLib && detectedType) ? detectedType : type,
+          provider,
+          id,
+          status: isInLib ? 'added' : 'pending',
           addedAt: isInLib ? now : null
         };
         data.entries.push(existing);
-        log(`🆕 "${title}" -> ${isInLib ? `✅ Found: "${plexTitle}"` : '🕓 Pending'}`);
-        if (isInLib) addedThisScan.push(existing);
 
+        if (isInLib) {
+          log(`[NEW] "${title}" -> "${plexTitle}" (available)`);
+          addedThisScan.push(existing);
+        } else {
+          log(`[NEW] "${title}" (pending)`);
+        }
       } else {
-        // If the item already existed...
-        
-        // 0. Type correction if necessary (e.g., movie -> show)
-        // Absolute priority to what Plex found. If Plex says it's a show, it's a show.
+        // Existing item - update if needed
+
+        // Update type if Plex detected different
         if (isInLib && detectedType && existing.type !== detectedType) {
-           log(`🔄 Type correction (Plex): "${existing.title}" (${existing.type} ➔ ${detectedType})`);
-           existing.type = detectedType;
-        }
-        // Otherwise, check if RSS changed its mind (rare for Letterboxd but possible elsewhere)
-        else if (existing.type !== type) {
-           log(`🔄 Type correction (RSS): "${existing.title}" (${existing.type} ➔ ${type})`);
-           existing.type = type;
+          log(`[TYPE] "${existing.title}" (${existing.type} -> ${detectedType})`);
+          existing.type = detectedType;
         }
 
-        // 1. Update title if Plex found a better one (e.g., French title)
+        // Update title if Plex has different (localized) title
         if (isInLib && plexTitle && existing.title !== plexTitle) {
-           log(`🇫🇷 Title translation: "${existing.title}" ➔ "${plexTitle}"`);
-           existing.title = plexTitle;
+          log(`[TITLE] "${existing.title}" -> "${plexTitle}"`);
+          existing.title = plexTitle;
         }
-        
-        // 2. Status update (Pending -> Added)
+
+        // Update status: pending -> added
         if (isInLib && existing.status !== 'added') {
-          existing.status  = 'added';
+          existing.status = 'added';
           existing.addedAt = now;
-          log(`✅ "${existing.title}" is now available!`);
+          log(`[AVAILABLE] "${existing.title}"`);
           addedThisScan.push(existing);
         }
 
-        // 3. Downgrade (Added -> Pending) if content disappeared from Plex
+        // Downgrade: added -> pending (content removed from Plex)
         if (!isInLib && existing.status === 'added') {
-            existing.status = 'pending';
-            log(`⚠️ "${existing.title}" is no longer detected in Plex -> Back to pending.`);
+          existing.status = 'pending';
+          log(`[REMOVED] "${existing.title}" -> pending`);
         }
       }
     }
 
-    // CLEANUP: Remove items no longer in RSS (except if already added)
+    // Cleanup: remove items no longer in RSS (except 'added' ones)
     const beforeCount = data.entries.length;
     data.entries = data.entries.filter(entry => {
-      if (entry.status === 'added') return true; // Keep history of additions
+      if (entry.status === 'added') return true;
       const existsInRss = allItems.some(rssItem => {
-        if (rssItem.provider && rssItem.id && entry.provider && entry.id) return rssItem.provider === entry.provider && rssItem.id === entry.id;
+        if (rssItem.provider && rssItem.id && entry.provider && entry.id) {
+          return rssItem.provider === entry.provider && rssItem.id === entry.id;
+        }
         return rssItem.title === entry.title;
       });
-      if (!existsInRss) log(`🗑️ Deleted (no longer in RSS): "${entry.title}"`);
+      if (!existsInRss) log(`[CLEANUP] "${entry.title}" removed from watchlist`);
       return existsInRss;
     });
-    if (beforeCount - data.entries.length > 0) log(`🧹 Cleanup completed.`);
 
-    // DISCORD NOTIFICATIONS
-    // Using addedThisScan which is more reliable than timestamp
-    if (addedThisScan.length > 0 && addedThisScan.length < 50) { 
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    log(`[SCAN] Processed ${allItems.length} items in ${elapsed}s`);
+
+    // Discord: cleanup old added messages (>24h)
+    data.messages.added = await cleanupOldAddedMessages({
+      client,
+      channelId: config.discordChannelId,
+      addedMessages: data.messages.added,
+      maxAge: 24 * 60 * 60 * 1000
+    });
+
+    // Discord: send new additions notification
+    if (addedThisScan.length > 0 && addedThisScan.length < 50) {
       const emb = buildAddedEmbed(addedThisScan);
-      const ch  = await client.channels.fetch(config.discordChannelId);
-      await ch.send({ embeds: [emb] });
+      const msgInfo = await sendAddedMessage({
+        client,
+        channelId: config.discordChannelId,
+        embed: emb
+      });
+      if (msgInfo) {
+        data.messages.added.push(msgInfo);
+        log(`[DISCORD] Sent notification (${addedThisScan.length} items, auto-delete in 24h)`);
+      }
     }
 
+    // Discord: update pending list
     const pending = data.entries.filter(e => e.status === 'pending');
     const embPend = buildPendingEmbed(pending);
-    const msgId = await sendOrUpdateEmbed({ client, channelId: config.discordChannelId, messageId: data.messages.pending, embed: embPend });
+    const msgId = await sendOrUpdateEmbed({
+      client,
+      channelId: config.discordChannelId,
+      messageId: data.messages.pending,
+      embed: embPend
+    });
     if (msgId) data.messages.pending = msgId;
 
-    // UPDATE HISTORY
+    // Update history
     if (!data.history) data.history = [];
     data.history.push({ date: Date.now(), pending: pending.length });
     if (data.history.length > 50) data.history.shift();
 
+    // Save
     fs.writeFileSync(FILE, JSON.stringify(data, null, 2));
-    log('💾 watchlist.json updated.');
+    log('[SAVE] watchlist.json updated');
 
     const addedFilms = addedThisScan.filter(e => e.type === 'movie').length;
     const addedShows = addedThisScan.filter(e => e.type === 'show').length;
+
+    log(`\n=== Scan complete: ${addedFilms} movies, ${addedShows} shows added ===\n`);
+
     return { addedFilms, addedShows };
 
   } catch (error) {
-    console.error("❌ Critical error during scan:", error);
+    console.error("[ERROR] Scan failed:", error);
     return { addedFilms: 0, addedShows: 0 };
   } finally {
     isScanning = false;
   }
 }
 
+// CLI arguments
 const args = process.argv.slice(2);
 
 if (args.includes('--test')) {
-  log("🧪 TEST mode enabled: Single execution then exit.");
+  log("[TEST] Single scan mode");
   run().then((res) => {
-    log(`📊 Results: ${res.addedFilms} movies, ${res.addedShows} shows.`);
+    log(`[RESULT] ${res.addedFilms} movies, ${res.addedShows} shows`);
     process.exit(0);
   });
 } else {
@@ -181,26 +217,24 @@ if (args.includes('--test')) {
   scheduleNext();
 }
 
-function scheduleNext () {
-  // If a custom interval is defined (in minutes), use it
+function scheduleNext() {
   if (config.scanInterval) {
     const intervalMs = config.scanInterval * 60 * 1000;
-    log(`⏰ Next automatic scan in ${config.scanInterval} minutes.`);
+    log(`[SCHEDULE] Next scan in ${config.scanInterval} minutes`);
     setInterval(run, intervalMs);
     return;
   }
 
-  // Otherwise, default behavior: daily at midnight
-  const now = new Date(); 
-  const next = new Date(); 
-  next.setHours(24, 0, 0, 0); // Next midnight
-  
+  // Default: daily at midnight
+  const now = new Date();
+  const next = new Date();
+  next.setHours(24, 0, 0, 0);
   if (next <= now) next.setDate(next.getDate() + 1);
 
-  log(`⏰ Next automatic scan: ${next.toLocaleString()}`);
-  
-  setTimeout(() => { 
-    run(); 
-    setInterval(run, 24 * 60 * 60 * 1000); 
+  log(`[SCHEDULE] Next scan: ${next.toLocaleString()}`);
+
+  setTimeout(() => {
+    run();
+    setInterval(run, 24 * 60 * 60 * 1000);
   }, next - now);
 }

@@ -1,4 +1,6 @@
 // utils/plexChecker.js
+// Plex availability checker with optimized GUID indexing
+
 import fetch from 'node-fetch';
 
 let logFn = console.log;
@@ -7,31 +9,43 @@ let errorFn = console.error;
 
 export function setPlexLogger(fn) {
   logFn = fn;
-  warnFn = (msg) => fn(`⚠️ ${msg}`);
-  errorFn = (msg) => fn(`❌ ${msg}`);
+  warnFn = (msg) => fn(`[WARN] ${msg}`);
+  errorFn = (msg) => fn(`[ERROR] ${msg}`);
 }
 
-// CACHE GLOBAL POUR LA SESSION DE SCAN
-// Key: "sectionID_year" (ex: "1_2024")
-// Value: Array of items metadata
-const scanCache = new Map();
-let sectionsCache = null; // Cache pour les sections
+// ═══════════════════════════════════════════════════════════════════════════
+// GUID INDEX - Loaded once at scan start for O(1) lookups
+// ═══════════════════════════════════════════════════════════════════════════
 
+let guidIndex = {
+  imdb: new Map(),  // imdb_id -> {title, year, ratingKey, type, sectionId}
+  tmdb: new Map(),  // tmdb_id -> {title, year, ratingKey, type, sectionId}
+  tvdb: new Map(),  // tvdb_id -> {title, year, ratingKey, type, sectionId}
+  loaded: false,
+  itemCount: 0
+};
+
+let sectionsCache = null;
+
+/**
+ * Clear all caches (call between scans)
+ */
 export function clearScanCache() {
-  scanCache.clear();
-  sectionsCache = null; // On force le rechargement des sections au prochain scan
-  // logFn('🧹 Cache de scan vidé.');
+  guidIndex = {
+    imdb: new Map(),
+    tmdb: new Map(),
+    tvdb: new Map(),
+    loaded: false,
+    itemCount: 0
+  };
+  sectionsCache = null;
 }
 
-function normalize(str) {
-  if (!str) return '';
-  return str.toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]/g, "");
-}
-
+/**
+ * Get library sections (movies and shows)
+ */
 async function getLibrarySections(config) {
-  if (sectionsCache) return sectionsCache; // Retourne le cache si dispo
+  if (sectionsCache) return sectionsCache;
 
   const url = `${config.plexUrl}/library/sections?X-Plex-Token=${config.plexToken}`;
   try {
@@ -39,356 +53,337 @@ async function getLibrarySections(config) {
     if (!res.ok) return [];
     const json = await res.json();
     const allSections = json.MediaContainer?.Directory || [];
-    
-    // Filtrer pour ne garder que les bibliothèques de films et séries
-    // ET qui ne sont pas dans la liste d'exclusion
-    const excluded = config.excludeLibraries || [];
 
+    const excluded = config.excludeLibraries || [];
     const sections = allSections
       .filter(s => ['movie', 'show'].includes(s.type))
       .filter(s => !excluded.includes(s.title))
-      .map(s => ({ id: String(s.key), type: s.type }));
+      .map(s => ({ id: String(s.key), type: s.type, title: s.title }));
 
-    logFn(`📚 Sections détectées : ${sections.map(s => `${s.id} (${s.type})`).join(', ')}`);
-    sectionsCache = sections; // Sauvegarde dans le cache
+    sectionsCache = sections;
     return sections;
   } catch (e) {
-    warnFn('Impossible de récupérer les sections de la bibliothèque Plex.');
+    warnFn('Failed to fetch Plex sections');
     return [];
   }
 }
 
 /**
- * Récupère les métadonnées complètes d'un item via son ratingKey.
- * Indispensable pour les séries où la liste globale ne contient pas toujours les GUIDs externes.
+ * Build GUID index from all library items
+ * This is the key optimization - load once, lookup O(1)
  */
-async function fetchItemDetails(config, ratingKey) {
-  const url = `${config.plexUrl}/library/metadata/${ratingKey}?includeGuids=1&X-Plex-Token=${config.plexToken}`;
-  try {
-    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-    if (!res.ok) return null;
-    const json = await res.json();
-    return json.MediaContainer?.Metadata?.[0] || null;
-  } catch (e) {
-    return null;
-  }
-}
+export async function buildGuidIndex(config) {
+  if (guidIndex.loaded) return guidIndex;
 
-/**
- * Vérifie si un item Plex correspond strictement à l'ID recherché.
- * Gère les subtilités IMDb (tt...) et TVDB (tvdb vs thetvdb).
- */
-function isIdMatch(item, provider, id) {
-  if (!provider || !id) return false;
+  const sections = await getLibrarySections(config);
+  const startTime = Date.now();
 
-  const externalGuids = item.Guid || [];
-  const targetGuid = `${provider}://${id}`;
+  logFn(`[INDEX] Building GUID index from ${sections.length} sections...`);
 
-  // 1. Match Strict Exact
-  let match = externalGuids.some(g => g.id === targetGuid);
+  for (const section of sections) {
+    const plexType = section.type === 'show' ? '2' : '1';
+    let start = 0;
+    const size = 200;
+    let hasMore = true;
 
-  // 2. Fallback IMDb (tt...)
-  if (!match && id.startsWith('tt')) {
-      match = externalGuids.some(g => g.id && g.id.endsWith(`://${id}`));
-      // Legacy agent
-      if (!match && item.guid) {
-        match = item.guid.includes(`://${id}`) || item.guid.endsWith(id);
-      }
-  }
+    while (hasMore) {
+      const url = `${config.plexUrl}/library/sections/${section.id}/all?type=${plexType}&includeGuids=1&X-Plex-Container-Start=${start}&X-Plex-Container-Size=${size}&X-Plex-Token=${config.plexToken}`;
 
-  // 3. Fallback TVDB (tvdb vs thetvdb)
-  if (!match && provider === 'tvdb') {
-      match = externalGuids.some(g => g.id && (g.id === `thetvdb://${id}` || g.id.endsWith(`/${id}`)));
-      // Legacy agent
-      if (!match && item.guid) {
-        match = item.guid.includes(`thetvdb://${id}`) || item.guid.includes(`tvdb://${id}`);
-      }
-  }
+      try {
+        const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+        if (!res.ok) break;
 
-  return match;
-}
-
-/**
- * Vérifie via Tautulli si disponible
- * Utilise get_library_media_info pour chercher par ID ou Titre
- * Et vérifie le ratingKey via Plex pour confirmation ID absolue.
- */
-async function checkViaTautulli(config, title, year, provider, id, sectionsList) {
-  if (!config.tautulliUrl || !config.tautulliApiKey) return null;
-  
-  const baseUrl = config.tautulliUrl;
-  const apiKey = config.tautulliApiKey;
-  
-  // On scanne toutes les sections disponibles pour être exhaustif
-  const sectionIDs = sectionsList.map(s => s.id);
-
-  for (const sectionId of sectionIDs) {
-    try {
-      let candidates = [];
-
-      // 1. Recherche par ID (Prioritaire)
-      if (id) {
-        const url = `${baseUrl}/api/v2?apikey=${apiKey}&cmd=get_library_media_info&section_id=${sectionId}&search=${encodeURIComponent(id)}`;
-        const res = await fetch(url);
         const json = await res.json();
-        const items = json.response?.data?.data || [];
-        candidates.push(...items);
-      }
+        const items = json.MediaContainer?.Metadata || [];
 
-      // 2. Recherche par Titre (Si ID ne donne rien ou pour compléter)
-      // On le fait si on n'a pas trouvé de candidats par ID, ou si on veut être sûr.
-      if (candidates.length === 0 && title) {
-         const url = `${baseUrl}/api/v2?apikey=${apiKey}&cmd=get_library_media_info&section_id=${sectionId}&search=${encodeURIComponent(title)}`;
-         const res = await fetch(url);
-         const json = await res.json();
-         const items = json.response?.data?.data || [];
-         // On évite les doublons
-         for (const it of items) {
-             if (!candidates.some(c => c.rating_key === it.rating_key)) {
-                 candidates.push(it);
-             }
-         }
-      }
+        for (const item of items) {
+          const guids = item.Guid || [];
+          const entry = {
+            title: item.title,
+            year: item.year,
+            ratingKey: item.ratingKey,
+            type: section.type,
+            sectionId: section.id
+          };
 
-      // 3. Vérification via Plex (RatingKey)
-      for (const candidate of candidates) {
-          if (!candidate.rating_key) continue;
-          
-          // On récupère les métadonnées complètes Plex pour vérifier les GUIDs
-          const fullItem = await fetchItemDetails(config, candidate.rating_key);
-          if (fullItem) {
-              // Vérification ID stricte
-              if (isIdMatch(fullItem, provider, id)) {
-                  const section = sectionsList.find(s => s.id === String(sectionId));
-                  const detectedType = section ? section.type : null;
-                  
-                  logFn(`🎯 [Tautulli] Match confirmé via Plex ! (Section ${sectionId}) "${title}" -> "${fullItem.title}"`);
-                  return { found: true, plexTitle: fullItem.title, detectedType };
-              }
+          for (const g of guids) {
+            const id = g.id || '';
+            if (id.startsWith('imdb://')) {
+              guidIndex.imdb.set(id.replace('imdb://', ''), entry);
+            } else if (id.startsWith('tmdb://')) {
+              guidIndex.tmdb.set(id.replace('tmdb://', ''), entry);
+            } else if (id.startsWith('tvdb://') || id.startsWith('thetvdb://')) {
+              const tvdbId = id.replace('tvdb://', '').replace('thetvdb://', '');
+              guidIndex.tvdb.set(tvdbId, entry);
+            }
           }
+          guidIndex.itemCount++;
+        }
+
+        if (items.length < size) hasMore = false;
+        else start += size;
+      } catch (e) {
+        warnFn(`Failed to index section ${section.id}: ${e.message}`);
+        break;
       }
-    } catch (e) {
-      warnFn(`Erreur Tautulli check (Section ${sectionId}): ${e.message}`);
     }
   }
+
+  guidIndex.loaded = true;
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  logFn(`[INDEX] Indexed ${guidIndex.itemCount} items (IMDb: ${guidIndex.imdb.size}, TMDb: ${guidIndex.tmdb.size}, TVDB: ${guidIndex.tvdb.size}) in ${elapsed}s`);
+
+  return guidIndex;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FAST PATH - Direct GUID lookup (O(1), no API calls)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fast lookup by ID in the GUID index
+ * Returns match instantly without any API calls
+ */
+function lookupByGuid(provider, id) {
+  if (!id || !guidIndex.loaded) return null;
+
+  let entry = null;
+
+  if (provider === 'imdb' || id.startsWith('tt')) {
+    entry = guidIndex.imdb.get(id);
+  } else if (provider === 'tmdb') {
+    entry = guidIndex.tmdb.get(id);
+  } else if (provider === 'tvdb') {
+    entry = guidIndex.tvdb.get(id);
+  }
+
+  // Also try IMDb if ID looks like tt...
+  if (!entry && id.startsWith('tt')) {
+    entry = guidIndex.imdb.get(id);
+  }
+
+  return entry;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRING NORMALIZATION - For title comparison
+// ═══════════════════════════════════════════════════════════════════════════
+
+function normalize(str) {
+  if (!str) return '';
+  return str.toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[:\-–—_]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TAUTULLI SEARCH - Fast search via Tautulli API
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function checkViaTautulli(config, title, year, provider, id) {
+  if (!config.tautulliUrl || !config.tautulliApiKey) return null;
+
+  const sections = await getLibrarySections(config);
+  const baseUrl = config.tautulliUrl;
+  const apiKey = config.tautulliApiKey;
+
+  for (const section of sections) {
+    try {
+      // Search by ID first (most reliable)
+      if (id) {
+        const url = `${baseUrl}/api/v2?apikey=${apiKey}&cmd=get_library_media_info&section_id=${section.id}&search=${encodeURIComponent(id)}`;
+        const res = await fetch(url);
+        const json = await res.json();
+        const results = json.response?.data?.data || [];
+
+        for (const r of results) {
+          // Verify match via GUID index
+          const indexed = lookupByGuid(provider, id);
+          if (indexed && String(indexed.ratingKey) === String(r.rating_key)) {
+            return { found: true, plexTitle: indexed.title, detectedType: indexed.type };
+          }
+        }
+      }
+
+      // Fallback: search by title (strict matching)
+      if (title) {
+        const url = `${baseUrl}/api/v2?apikey=${apiKey}&cmd=get_library_media_info&section_id=${section.id}&search=${encodeURIComponent(title)}`;
+        const res = await fetch(url);
+        const json = await res.json();
+        const results = json.response?.data?.data || [];
+
+        for (const r of results) {
+          // Strict title match: normalized titles must be very similar
+          const normSearch = normalize(title);
+          const normResult = normalize(r.title);
+
+          // Only accept exact match or if one is a substring and length difference is small
+          const titleMatch = normSearch === normResult ||
+            (normSearch === normResult.split(' ')[0] && normSearch.length >= 8) ||
+            (normResult === normSearch.split(' ')[0] && normResult.length >= 8);
+
+          // Year must match (±1 year tolerance)
+          const yearMatch = year && r.year && Math.abs(parseInt(r.year) - parseInt(year)) <= 1;
+
+          if (titleMatch && yearMatch) {
+            return { found: true, plexTitle: r.title, detectedType: section.type };
+          }
+        }
+      }
+    } catch (e) {
+      // Tautulli error, continue to next method
+    }
+  }
+
   return null;
 }
 
-/**
- * Fonction interne qui exécute la recherche Plex (M1 + M2) pour un type donné.
- */
-async function checkTypeInPlex(title, year, type, config, provider, id, sectionsList) {
-  const token = config.plexToken;
-  const plexBase = config.plexUrl || 'http://localhost:32400'; 
-  const headers = { 'Accept': 'application/json' };
-  const plexType = (type === 'show') ? '2' : '1';
+// ═══════════════════════════════════════════════════════════════════════════
+// TITLE SEARCH - Plex API search by title (fallback for items without ID)
+// ═══════════════════════════════════════════════════════════════════════════
 
-  // Filtrage des sections : on ne scanne que les bibliothèques du type demandé
-  const relevantSections = sectionsList.filter(s => s.type === type).map(s => s.id);
+async function searchByTitle(config, title, year, type) {
+  const plexType = type === 'show' ? '2' : '1';
+  const url = `${config.plexUrl}/search?query=${encodeURIComponent(title)}&type=${plexType}&includeGuids=1&X-Plex-Container-Size=30&X-Plex-Token=${config.plexToken}`;
 
-  // --- M1: Recherche par Titre + Filtrage strict ---
   try {
-    const searchUrl = `${plexBase}/search?query=${encodeURIComponent(title)}&type=${plexType}&includeGuids=1&X-Plex-Container-Size=50&X-Plex-Token=${token}`;
-    const res = await fetch(searchUrl, { headers });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    if (!res.ok) return null;
+
     const json = await res.json();
     const results = json.MediaContainer?.Metadata || [];
 
+    // Find best match by title similarity and year
     for (const item of results) {
-      if (relevantSections.length > 0 && !relevantSections.includes(String(item.librarySectionID))) continue;
+      const normTitle = normalize(title);
+      const normPlex = normalize(item.title);
 
-      // 1. Vérification par ID
-      if (provider && id) {
-        if (isIdMatch(item, provider, id)) {
-           logFn(`🎯 [M1] Titre "${title}" trouvé via ID Strict (${provider}://${id}) -> "${item.title}"`);
-           return { found: true, plexTitle: item.title };
-        }
-        continue;
-      }
+      // Check for title match (exact or contains)
+      const titleMatch = normTitle === normPlex ||
+        normTitle.includes(normPlex) ||
+        normPlex.includes(normTitle);
 
-      // 2. Vérification par Titre + Année
-      const itemYear = parseInt(item.year);
-      const targetYear = parseInt(year);
-      const yearMatch = !year || !itemYear || (Math.abs(itemYear - targetYear) <= 1);
-      
-      const cleanTitle = normalize(title);
-      const cleanPlexTitle = normalize(item.title);
-      const cleanOriginal = normalize(item.originalTitle);
+      // Check year (allow ±1 year tolerance)
+      const yearMatch = !year || !item.year ||
+        Math.abs(parseInt(year) - parseInt(item.year)) <= 1;
 
-      if (yearMatch && (cleanTitle === cleanPlexTitle || cleanTitle === cleanOriginal)) {
-        logFn(`🎯 [M1] Titre Match -> "${item.title}" (Année: ${item.year})`);
-        return { found: true, plexTitle: item.title };
+      if (titleMatch && yearMatch) {
+        return { found: true, plexTitle: item.title, detectedType: type };
       }
     }
-  } catch (e) { 
-    errorFn(`Erreur check Plex (M1) pour "${title}": ${e.message}`); 
+  } catch (e) {
+    // Search failed
   }
 
-  // --- M2: Scan Structuré par Année (Méthode Ultime) ---
-  if (id && year) {
-    try {
-      const yearsToScan = [year, year - 1, year + 1];
-      const uniqueYears = [...new Set(yearsToScan)].filter(y => y > 1900 && y < 2100);
-
-      for (const sectionID of relevantSections) {
-        for (const scanYear of uniqueYears) {
-          const cacheKey = `${sectionID}_${scanYear}`;
-          let items = [];
-
-          if (scanCache.has(cacheKey)) {
-            items = scanCache.get(cacheKey);
-          } else {
-            let start = 0;
-            const size = 100; 
-            let hasMore = true;
-            
-            while (hasMore) {
-              const url = `${plexBase}/library/sections/${sectionID}/all?type=${plexType}&year=${scanYear}&includeGuids=1&X-Plex-Container-Start=${start}&X-Plex-Container-Size=${size}&X-Plex-Token=${token}`;
-              const res = await fetch(url, { headers });
-              if (!res.ok) break;
-
-              const json = await res.json();
-              const metaItems = json.MediaContainer?.Metadata || [];
-              const dirItems  = json.MediaContainer?.Directory || [];
-              const pageItems = [...metaItems, ...dirItems];
-              
-              items.push(...pageItems);
-
-              if (pageItems.length < size) hasMore = false;
-              else start += size;
-            }
-            scanCache.set(cacheKey, items);
-            logFn(`🔎 [M2] Scan Section ${sectionID} | Année ${scanYear} : ${items.length} éléments trouvés.`);
-          }
-
-          for (const item of items) {
-            if (isIdMatch(item, provider, id)) {
-               logFn(`🎯 [M2-Ultime] Scan Année ${scanYear} (Cible: ${year}) (Section ${sectionID}) -> Trouvé : "${item.title}"`);
-               return { found: true, plexTitle: item.title };
-            }
-          }
-
-          // --- DEEP SCAN (Spécial Séries) ---
-          if (plexType === '2') {
-            const incompleteItems = items.filter(i => !i.Guid || i.Guid.length === 0);
-            if (incompleteItems.length > 0) {
-                for (const incomplete of incompleteItems) {
-                    if (!incomplete.ratingKey) continue;
-                    const fullItem = await fetchItemDetails(config, incomplete.ratingKey);
-                    if (fullItem && isIdMatch(fullItem, provider, id)) {
-                        logFn(`🎯 [M2-DeepScan] Trouvé via scan approfondi ! -> "${fullItem.title}"`);
-                        return { found: true, plexTitle: fullItem.title };
-                    }
-                }
-            }
-          }
-        }
-      }
-    } catch (e) {
-      errorFn(`Erreur check Plex (M2-Ultime) pour "${title}": ${e.message}`);
-    }
-  }
-
-  // --- M3: Scan Global (Méthode Nucléaire) ---
-  // Si on a un ID et qu'on n'a toujours rien trouvé, on scanne l'intégralité de la section.
-  // C'est la seule méthode 100% fiable si le titre ne correspond pas et que Tautulli ne trouve pas l'ID.
-  if (id) {
-    try {
-      for (const sectionID of relevantSections) {
-        const cacheKey = `${sectionID}_ALL`;
-        let items = [];
-
-        if (scanCache.has(cacheKey)) {
-          items = scanCache.get(cacheKey);
-        } else {
-          let start = 0;
-          const size = 200; 
-          let hasMore = true;
-          
-          logFn(`☢️ [M3-Nuclear] Lancement scan complet Section ${sectionID} (ID: ${provider}://${id})...`);
-
-          while (hasMore) {
-            const url = `${plexBase}/library/sections/${sectionID}/all?type=${plexType}&includeGuids=1&X-Plex-Container-Start=${start}&X-Plex-Container-Size=${size}&X-Plex-Token=${token}`;
-            const res = await fetch(url, { headers });
-            if (!res.ok) break;
-
-            const json = await res.json();
-            const metaItems = json.MediaContainer?.Metadata || [];
-            const dirItems  = json.MediaContainer?.Directory || [];
-            const pageItems = [...metaItems, ...dirItems];
-            
-            items.push(...pageItems);
-
-            if (pageItems.length < size) hasMore = false;
-            else start += size;
-          }
-          scanCache.set(cacheKey, items);
-          logFn(`☢️ [M3-Nuclear] Section ${sectionID} chargée en cache : ${items.length} éléments.`);
-        }
-
-        for (const item of items) {
-          if (isIdMatch(item, provider, id)) {
-             logFn(`🎯 [M3-Nuclear] Trouvé dans le scan complet ! -> "${item.title}"`);
-             return { found: true, plexTitle: item.title };
-          }
-        }
-        
-        // Deep Scan M3 (Only for items without GUIDs)
-        if (plexType === '2') {
-             const incompleteItems = items.filter(i => !i.Guid || i.Guid.length === 0);
-             if (incompleteItems.length > 0) {
-                 for (const incomplete of incompleteItems) {
-                    if (!incomplete.ratingKey) continue;
-                    const fullItem = await fetchItemDetails(config, incomplete.ratingKey);
-                    if (fullItem && isIdMatch(fullItem, provider, id)) {
-                        logFn(`🎯 [M3-DeepScan] Trouvé via scan approfondi ! -> "${fullItem.title}"`);
-                        return { found: true, plexTitle: fullItem.title };
-                    }
-                 }
-             }
-        }
-      }
-    } catch (e) {
-      errorFn(`Erreur check Plex (M3-Nuclear) pour "${title}": ${e.message}`);
-    }
-  }
-
-  return { found: false, plexTitle: null };
+  return null;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// MAIN CHECK FUNCTION - Tiered approach with fast path
+// ═══════════════════════════════════════════════════════════════════════════
+
 /**
- * Retourne un objet : { found: boolean, plexTitle: string | null, detectedType: string | null }
+ * Check if content is available in Plex
+ *
+ * Tier 0: GUID Index lookup (instant, requires ID)
+ * Tier 1: Tautulli search (fast)
+ * Tier 2: Plex title search (medium)
+ *
+ * M3 full scan is REMOVED - too slow and rarely needed with IDs
+ *
+ * @returns {{ found: boolean, plexTitle: string|null, detectedType: string|null }}
  */
 export async function checkIfInPlex(title, year, type, config, provider = null, id = null) {
-  // Récupérer les sections (objets {id, type})
-  const sectionsList = await getLibrarySections(config);
-
-  // --- M0: Tautulli Check (Prioritaire) ---
-  const tautulliRes = await checkViaTautulli(config, title, year, provider, id, sectionsList);
-  if (tautulliRes) {
-    return { 
-      ...tautulliRes, 
-      detectedType: tautulliRes.detectedType || type 
-    };
+  // Ensure index is built
+  if (!guidIndex.loaded) {
+    await buildGuidIndex(config);
   }
 
-  // --- 1. Essai avec le type demandé (ex: movie) ---
-  // logFn(`🕵️ [PlexCheck] Vérification 1/2 : Type "${type}"...`);
-  let res = await checkTypeInPlex(title, year, type, config, provider, id, sectionsList);
-  if (res.found) return { ...res, detectedType: type };
-
-  // --- 2. Essai avec le type opposé (ex: show) ---
-  // Utile pour les flux RSS (Letterboxd) qui mettent tout en "movie"
-  const otherType = (type === 'movie') ? 'show' : 'movie';
-  // On ne tente l'inversion que si on a un ID ou un titre clair, pour éviter trop de requêtes
-  // Mais ici on veut être exhaustif.
-  
-  // logFn(`🕵️ [PlexCheck] Vérification 2/2 : Type "${otherType}"...`);
-  res = await checkTypeInPlex(title, year, otherType, config, provider, id, sectionsList);
-  if (res.found) {
-      logFn(`💡 [SmartCheck] Trouvé ! C'était en fait un(e) "${otherType}".`);
-      return { ...res, detectedType: otherType };
+  // ═══════════════════════════════════════════════════════════════════════
+  // TIER 0: GUID Index Lookup (instant, O(1))
+  // This is the fast path - no API calls needed
+  // ═══════════════════════════════════════════════════════════════════════
+  if (id) {
+    const indexed = lookupByGuid(provider, id);
+    if (indexed) {
+      logFn(`[T0] "${title}" -> "${indexed.title}" (instant match)`);
+      return { found: true, plexTitle: indexed.title, detectedType: indexed.type };
+    }
   }
 
-  return { found: false, plexTitle: null };
+  // ═══════════════════════════════════════════════════════════════════════
+  // TIER 1: Tautulli Search (fast)
+  // ═══════════════════════════════════════════════════════════════════════
+  const tautulliResult = await checkViaTautulli(config, title, year, provider, id);
+  if (tautulliResult?.found) {
+    logFn(`[T1] "${title}" -> "${tautulliResult.plexTitle}" (Tautulli)`);
+    return tautulliResult;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // TIER 2: Plex Title Search (fallback for items without ID)
+  // ═══════════════════════════════════════════════════════════════════════
+  if (!id) {
+    const searchResult = await searchByTitle(config, title, year, type);
+    if (searchResult?.found) {
+      logFn(`[T2] "${title}" -> "${searchResult.plexTitle}" (title search)`);
+      return searchResult;
+    }
+
+    // Try opposite type (movie <-> show)
+    const otherType = type === 'movie' ? 'show' : 'movie';
+    const altResult = await searchByTitle(config, title, year, otherType);
+    if (altResult?.found) {
+      logFn(`[T2] "${title}" -> "${altResult.plexTitle}" (found as ${otherType})`);
+      return { ...altResult, detectedType: otherType };
+    }
+  }
+
+  // Not found in Plex
+  return { found: false, plexTitle: null, detectedType: null };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BATCH PROCESSING - Process multiple items in parallel
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check multiple items in parallel
+ * @param {Array} items - Array of {title, year, type, provider, id}
+ * @param {Object} config - Configuration
+ * @param {number} concurrency - Max concurrent checks (default 10)
+ * @returns {Promise<Map>} - Map of item -> result
+ */
+export async function checkBatch(items, config, concurrency = 10) {
+  // Ensure index is built first
+  if (!guidIndex.loaded) {
+    await buildGuidIndex(config);
+  }
+
+  const results = new Map();
+
+  // Process in chunks
+  for (let i = 0; i < items.length; i += concurrency) {
+    const chunk = items.slice(i, i + concurrency);
+    const promises = chunk.map(async (item) => {
+      const result = await checkIfInPlex(
+        item.title,
+        item.year,
+        item.type,
+        config,
+        item.provider,
+        item.id
+      );
+      return { item, result };
+    });
+
+    const chunkResults = await Promise.all(promises);
+    for (const { item, result } of chunkResults) {
+      results.set(item, result);
+    }
+  }
+
+  return results;
 }
