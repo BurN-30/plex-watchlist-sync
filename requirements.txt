@@ -1,2 +1,16 @@
-# Python dependencies for Letterboxd RSS feed generator
-letterboxdpy>=2.0.0
+# ═══════════════════════════════════════════════════════════════
+# Dépendances Python pour plex-watchlist-sync
+# Installation: pip install -r requirements.txt
+# ═══════════════════════════════════════════════════════════════
+
+# Letterboxd scraping (bibliothèque communautaire)
+# Note: Cette lib fait du web scraping et peut casser si Letterboxd change son HTML
+# Le script a un fallback custom si ça arrive
+letterboxdpy>=6.0.0
+
+# Fallback scraper (utilisé si letterboxdpy échoue)
+requests>=2.28.0
+beautifulsoup4>=4.11.0
+
+# Optionnel: meilleur parsing HTML (plus rapide que html.parser)
+lxml>=4.9.0

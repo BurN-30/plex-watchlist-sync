@@ -1,0 +1,49 @@
+{
+  "_metadata": {
+    "version": "2.0",
+    "last_verified": "2026-02-02",
+    "description": "CSS selectors for Letterboxd scraping. Update this file if the site changes its HTML structure.",
+    "changelog": "v2.0 (Feb 2026): Updated for React-based frontend. Container changed from ul.poster-list to ul.grid, items use div.react-component with data-item-* attributes."
+  },
+
+  "watchlist": {
+    "_comment": "Page: https://letterboxd.com/USERNAME/watchlist/",
+    "container": "ul.grid",
+    "item": "li.griditem",
+    "poster_div": "div.react-component[data-component-class='LazyPoster']",
+    "poster_attr_slug": "data-item-slug",
+    "poster_attr_id": "data-film-id",
+    "poster_attr_name": "data-item-name",
+    "poster_attr_link": "data-item-link",
+    "year_pattern": "\\((\\d{4})\\)$",
+    "pagination": {
+      "next_page": "a.next",
+      "page_param": "page"
+    }
+  },
+
+  "film_page": {
+    "_comment": "Page: https://letterboxd.com/film/SLUG/",
+    "imdb_link": "a[href*='imdb.com']",
+    "tmdb_link": "a[href*='themoviedb.org']",
+    "title": "h1.headline-1",
+    "year": "small.number a",
+    "director": "span.directorlist a",
+    "genres": "div.genres a",
+    "runtime": "p.text-footer"
+  },
+
+  "_howto_update": {
+    "step1": "Open https://letterboxd.com/USERNAME/watchlist/ in Chrome/Firefox",
+    "step2": "Right-click on a film poster -> 'Inspect Element'",
+    "step3": "Find div.react-component with data-component-class='LazyPoster'",
+    "step4": "Check data-item-slug, data-film-id, data-item-name attributes",
+    "step5": "Update selectors in this file if structure changed",
+    "step6": "Test: python scripts/letterboxd_scraper.py dave"
+  },
+
+  "_example_html_structure": {
+    "description": "Letterboxd HTML structure (February 2026 - React frontend)",
+    "html": "<ul class='grid'><li class='griditem'><div class='react-component' data-component-class='LazyPoster' data-item-slug='inception' data-film-id='12345' data-item-name='Inception (2010)' data-item-link='/film/inception/'><div class='poster film-poster'><img class='image' alt='Inception (2010)'/></div></div></li></ul>"
+  }
+}

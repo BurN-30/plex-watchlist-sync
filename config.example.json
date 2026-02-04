@@ -12,5 +12,8 @@
     "Private Library 2"
   ],
   "tautulliUrl": "http://localhost:8181",
-  "tautulliApiKey": "YOUR_TAUTULLI_API_KEY_HERE"
+  "tautulliApiKey": "YOUR_TAUTULLI_API_KEY_HERE",
+  "tmdbApiKey": "YOUR_TMDB_API_KEY_HERE",
+  "omdbApiKey": "YOUR_OMDB_API_KEY_HERE",
+  "scanInterval": 60
 }
